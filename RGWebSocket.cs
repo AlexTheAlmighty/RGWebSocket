@@ -36,7 +36,7 @@ namespace ReachableGames
 			private CancellationTokenSource _cancellationTokenSource;
 			private string                  _actualLastErr = string.Empty;
 			private byte[]                  _recvBuffer = new byte[kRecvBufferSize];
-
+			private DateTime				_idleSince;
 			// Basic metrics
 			public int    _uniqueId           { get; private set; }  // typically used by calling program to keep additional state in a dictionary
 			public string _displayId          { get; private set; }  // good for troubleshooting
@@ -47,22 +47,24 @@ namespace ReachableGames
 			public long   _stats_recvBytes    { get; private set; }
 			public long   _stats_msgQueuedTime { get; private set; }
 			public string _lastError          { get { return _actualLastErr; } private set { _actualLastErr = value; } }
+			public int _idleDisconnectInMinutes	  { get; private set; }
+			
 
 			// This is used to generate globally unique id per execution instance, which can be retrieved by the caller for routing/tracking purposes as a connection id.
 			static private volatile int _wsUID = 1;
 
 			// when we want to close, we push this through Send() so it knows to initiate closure.  Can be static because it's a sentinel, and compared by address.
-			static private byte[] sCloseOutputAsync = new byte[1];  
+			static private byte[] sCloseOutputAsync = new byte[1];
 
 			// Constructor takes different callbacks to handle the text/binary message and disconnection (which is called IN the send thread, not main thread).
 			// DisplayId is only a human-readable string, uniqueId is generated here but not used internally, and is guaranteed to increment every time a websocket is created, 
 			// and configuration for how to handle when the send is backed up. The cancellation source is a way for the caller to tear down the socket under any circumstances 
 			// without waiting, so even if sitting blocked on a send/recv, it stops immediately.
-			public RGWebSocket(Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect, Action<string, int> onLog, string displayId, WebSocket webSocket)
+			public RGWebSocket(Action<RGWebSocket, string> onReceiveMsgTextCb, Action<RGWebSocket, byte[]> onReceiveMsgBinaryCb, Action<RGWebSocket> onDisconnect, Action<string, int> onLog, string displayId, WebSocket webSocket, int idleDisconnect = -1)
 			{
-				if (onReceiveMsgTextCb==null || onReceiveMsgBinaryCb==null || onDisconnect==null)
+				if (onReceiveMsgTextCb == null || onReceiveMsgBinaryCb == null || onDisconnect == null)
 					throw new Exception("Cannot pass null in for receive callbacks or disconnection callback.");
-				if (webSocket==null)
+				if (webSocket == null)
 					throw new Exception("Cannot pass null in for webSocket.");
 
 				_outgoing = new ConcurrentQueue<Tuple<string, byte[], long>>();  // this handles limiting the queue and blocking on main thread for us
@@ -75,14 +77,38 @@ namespace ReachableGames
 				_webSocket = webSocket;
 				_uniqueId = Interlocked.Increment(ref _wsUID);
 				_cancellationTokenSource = new CancellationTokenSource();
+				_idleDisconnectInMinutes = idleDisconnect;
 
 				_releaseSendThread = new SemaphoreSlim(0, int.MaxValue);  // this is zero when no messages remain, non-zero when messages need to be sent
 				_recvTask = Recv(_cancellationTokenSource.Token);
 				_sendTask = Send(_cancellationTokenSource.Token);
-			}
 
-			// Let the client know when the connection is open for business.  Any other setting we shouldn't be pumping new messages into it.
-			public bool ReadyToSend { get { return _webSocket!=null && (_webSocket.State==WebSocketState.Open || _webSocket.State==WebSocketState.Connecting); } }
+				_idleSince = DateTime.UtcNow;
+                if (_idleDisconnectInMinutes > 0)
+                {
+                    var task = Task.Run(async () =>
+                    {
+                        while (this._webSocket?.State == WebSocketState.Open)
+                        {
+                            await Task.Delay(2000, _cancellationTokenSource.Token);
+                            tick();
+                        }
+                    }, _cancellationTokenSource.Token);
+                }
+            }
+
+            // Let the client know when the connection is open for business.  Any other setting we shouldn't be pumping new messages into it.
+            public bool ReadyToSend { get { return _webSocket!=null && (_webSocket.State==WebSocketState.Open || _webSocket.State==WebSocketState.Connecting); } }
+
+			void tick()
+			{
+				if (_webSocket != null && DateTime.UtcNow > _idleSince.AddMinutes(1))
+				{
+					_logger?.Invoke($"Closing socket, it was found to be idle for { _idleDisconnectInMinutes } minutes.", 0);
+					this.Abort(1000);
+				}
+
+			}
 
 			// This is called by this program when we want to close the websocket.
 			public void Close()
@@ -110,7 +136,6 @@ namespace ReachableGames
 				_sendTask?.Dispose();
 				_recvTask = null;
 				_sendTask = null;
-
 				_webSocket?.Dispose();
 				_webSocket = null;  // this should never be set to null before here.
 
@@ -177,6 +202,7 @@ namespace ReachableGames
 							WebSocketReceiveResult recvResult = null;
 							try
 							{
+								_idleSince = DateTime.UtcNow;
 								recvResult = await _webSocket.ReceiveAsync(new ArraySegment<byte>(_recvBuffer), token).ConfigureAwait(false);
 							}
 							catch (OperationCanceledException)  // not an error, flow control
@@ -366,8 +392,14 @@ namespace ReachableGames
 
 				try
 				{
-					// This waits a second on the off-chance Send exits due to an exception of some sort and Recv keeps running.
-					await _recvTask;  // make sure recv is exited before we do the disconnect callback.
+					// Give the connection 5 seconds to close gracefully, then kill it with the token
+					if (await Task.WhenAny(_recvTask, Task.Delay(2000, _cancellationTokenSource.Token)) == _recvTask)
+					{
+						// This waits a second on the off-chance Send exits due to an exception of some sort and Recv keeps running.
+						await _recvTask;  // make sure recv is exited before we do the disconnect callback.
+					}
+					else
+						_cancellationTokenSource.Cancel();
 				}
 				catch (Exception e)
 				{
@@ -375,6 +407,8 @@ namespace ReachableGames
 				}
 				finally  // must make sure we call _onDisconnectCallback, otherwise it's an infinite loop waiting for send threads to tear down
 				{
+					_logger?.Invoke("enter the finally", 0);
+
 					WebSocketState finalState = _webSocket != null ? _webSocket.State : WebSocketState.None;
 
 					// Let the program know this socket is dead -- note this is on the Send thread, NOT main thread!!!

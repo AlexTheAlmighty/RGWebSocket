@@ -241,7 +241,7 @@ namespace ReachableGames
 							HttpListenerWebSocketContext webSocketContext = await Task.Run(async () => { return await httpContext.AcceptWebSocketAsync(null).ConfigureAwait(false); }, upgradeTimeout.Token);
 							_logger?.Invoke("WebSocketServer.HandleConnection - websocket detected.  Upgraded.", 1);
 
-							RGWebSocket rgws = new RGWebSocket(_onReceiveMsgText, _onReceiveMsgBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket);
+							RGWebSocket rgws = new RGWebSocket(_onReceiveMsgText, _onReceiveMsgBinary, OnDisconnection, _logger, httpContext.Request.RemoteEndPoint.ToString(), webSocketContext.WebSocket, 25);
 							_websockets.TryAdd(rgws._uniqueId, rgws);
 							_websocketConnection(rgws);
 						}
