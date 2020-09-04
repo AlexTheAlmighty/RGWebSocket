@@ -7,7 +7,7 @@
     <Copyright>Copyright 2020 Reachable Games LLC</Copyright>
     <Description>A clean highly threaded C# websocket class that is easy to integrate into server code for multiple connections, based on .NET Core 3.1, suitable for servers.</Description>
     <PackageIcon>reachablegames.png</PackageIcon>
-    <SignAssembly>true</SignAssembly>
+    <SignAssembly>false</SignAssembly>
     <AssemblyOriginatorKeyFile>shadow.snk</AssemblyOriginatorKeyFile>
     <Platforms>AnyCPU</Platforms>
 	
